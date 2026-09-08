@@ -1,0 +1,10 @@
+qtde_vendas_pepsi = 130
+Valor_pepsi = 1.50
+Lucro_pepsi = qtde_vendas_pepsi * Valor_pepsi
+qtde_vendas_coca = 150
+Valor_coca = 1.50
+custo_loja = 100
+Lucro_coca = qtde_vendas_coca * Valor_coca
+faturameto_total = Lucro_coca + Lucro_pepsi
+Lucro_total = faturameto_total-custo_loja
+print("Margem de lucro=",Lucro_total / faturameto_total)

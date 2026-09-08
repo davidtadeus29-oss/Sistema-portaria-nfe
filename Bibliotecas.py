@@ -1,0 +1,17 @@
+import pyautogui
+import time
+x , y  = pyautogui.position()
+pyautogui.moveTo(424, 1056)
+pyautogui.doubleClick()
+time.sleep(5)
+pyautogui.moveTo(970, 342)
+pyautogui.doubleClick()
+time.sleep(5)
+pyautogui.write("OLIVDT")
+pyautogui.press('tab')
+time.sleep(5)
+pyautogui.moveTo(925, 1059)
+pyautogui.doubleClick()
+time.sleep(5)
+pyautogui.moveTo(413, 318)
+pyautogui.click()

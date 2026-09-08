@@ -1,0 +1,86 @@
+==== INICIO 26/08/2026 11:55:07,79 ==== 
+APP_DIR=C:\Users\OLIVDT\Desktop\Codigos PY 
+APP_FILE=app_com_criterios.py 
+PY=C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\python.exe 
+Rodando streamlit... 
+2026-08-26 11:55:09.701 Uvicorn server started on 127.0.0.1:8502
+
+  You can now view your Streamlit app in your browser.
+
+  URL: http://127.0.0.1:8502
+
+2026-08-26 12:46:10.882 Uncaught app execution
+Traceback (most recent call last):
+  File "C:\Users\OLIVDT\AppData\Roaming\Python\Python313\site-packages\streamlit\runtime\scriptrunner\exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+  File "C:\Users\OLIVDT\AppData\Roaming\Python\Python313\site-packages\streamlit\runtime\scriptrunner\script_runner.py", line 816, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OLIVDT\Desktop\Codigos PY\app_com_criterios.py", line 110, in <module>
+    df_estoque = carregar_arquivo(os.path.join(PASTA_RELATORIOS, arq_est))
+  File "C:\Users\OLIVDT\Desktop\Codigos PY\app_com_criterios.py", line 48, in carregar_arquivo
+    return pd.read_excel(caminho, sheet_name=0)
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 481, in read_excel
+    io = ExcelFile(
+        io,
+    ...<2 lines>...
+        engine_kwargs=engine_kwargs,
+    )
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 1604, in __init__
+    ext = inspect_excel_format(
+        content_or_path=path_or_buffer, storage_options=storage_options
+    )
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 1452, in inspect_excel_format
+    with get_handle(
+         ~~~~~~~~~~^
+        content_or_path, "rb", storage_options=storage_options, is_text=False
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ) as handle:
+    ^
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\common.py", line 939, in get_handle
+    handle = open(handle, ioargs.mode)
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\OLIVDT\\Desktop\\Relatorios_transferencia\\~$ESTOQUE.XLSX'
+2026-08-26 12:46:11.030 Uncaught app execution
+Traceback (most recent call last):
+  File "C:\Users\OLIVDT\AppData\Roaming\Python\Python313\site-packages\streamlit\runtime\scriptrunner\exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+  File "C:\Users\OLIVDT\AppData\Roaming\Python\Python313\site-packages\streamlit\runtime\scriptrunner\script_runner.py", line 816, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OLIVDT\Desktop\Codigos PY\app_com_criterios.py", line 110, in <module>
+    df_estoque = carregar_arquivo(os.path.join(PASTA_RELATORIOS, arq_est))
+  File "C:\Users\OLIVDT\Desktop\Codigos PY\app_com_criterios.py", line 48, in carregar_arquivo
+    return pd.read_excel(caminho, sheet_name=0)
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 481, in read_excel
+    io = ExcelFile(
+        io,
+    ...<2 lines>...
+        engine_kwargs=engine_kwargs,
+    )
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 1604, in __init__
+    ext = inspect_excel_format(
+        content_or_path=path_or_buffer, storage_options=storage_options
+    )
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\excel\_base.py", line 1452, in inspect_excel_format
+    with get_handle(
+         ~~~~~~~~~~^
+        content_or_path, "rb", storage_options=storage_options, is_text=False
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ) as handle:
+    ^
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\io\common.py", line 939, in get_handle
+    handle = open(handle, ioargs.mode)
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\OLIVDT\\Desktop\\Relatorios_transferencia\\~$ESTOQUE.XLSX'
+Exception in callback _ProactorBasePipeTransport._call_connection_lost()
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost()>
+Traceback (most recent call last):
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\asyncio\events.py", line 89, in _run
+    self._context.run(self._callback, *self._args)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OLIVDT\AppData\Local\Programs\Python\Python313\Lib\asyncio\proactor_events.py", line 165, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+^C
