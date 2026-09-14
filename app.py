@@ -5,7 +5,7 @@ import json
 import sqlite3
 import smtplib
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 from flask import Flask, render_template_string, request, jsonify, send_file
@@ -13,12 +13,45 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import openpyxl
 
+# Fuso horário local (corrige diferença de hora no Render)
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(os.getenv("APP_TZ", "America/Sao_Paulo"))
+except Exception:
+    LOCAL_TZ = timezone(timedelta(hours=-3))
+
 app = Flask(__name__)
 application = app  # compatível com gunicorn app:application
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "bipagem_nfe.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config_bipagem.json")
+
+
+# =========================
+# Helpers de data/hora
+# =========================
+def agora_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def parse_dt_banco(valor: str):
+    """
+    Converte ISO do banco para datetime com fuso local.
+    Aceita registros antigos sem tzinfo.
+    """
+    if not valor:
+        return None
+    try:
+        dt = datetime.fromisoformat(valor)
+    except Exception:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    else:
+        dt = dt.astimezone(LOCAL_TZ)
+    return dt
 
 
 # =========================
@@ -178,7 +211,7 @@ def template_email_desvio(dados):
 
 
 # =========================
-# HTML (sem onclick inline)
+# HTML
 # =========================
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -270,9 +303,11 @@ HTML = """<!DOCTYPE html>
       let ultTime = 0;
       let processando = false;
 
+      // Relógio apenas visual (navegador)
       setInterval(() => {
+        const d = new Date();
         document.getElementById('clock').innerText =
-          new Date().toLocaleDateString() + ' ' + new Date().toLocaleTimeString();
+          d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR');
       }, 1000);
 
       function focar() {
@@ -404,7 +439,6 @@ HTML = """<!DOCTYPE html>
         } catch (e) {}
       }
 
-      // sem onclick inline
       btnRegistrar.addEventListener('click', biparManual);
       btnLimpar.addEventListener('click', limpar);
       btnSalvarJust.addEventListener('click', salvarJust);
@@ -447,7 +481,7 @@ def api_bipar():
     if not d["valida"]:
         return jsonify({"sucesso": False, "mensagem": f"Chave inválida ({len(d['chave'])} dígitos). Precisa ter 44."})
 
-    agora = datetime.now()
+    agora = agora_local()
     dt_str = agora.strftime("%d/%m/%Y")
     hr_str = agora.strftime("%H:%M:%S")
     iso_str = agora.isoformat()
@@ -478,12 +512,12 @@ def api_bipar():
             }
         })
 
-    try:
-        dt1 = datetime.fromisoformat(nota["dt_completa_bip1"] or iso_str)
-    except Exception:
+    dt1 = parse_dt_banco(nota["dt_completa_bip1"])
+    if dt1 is None:
         dt1 = agora
 
     tempo_txt, mins = calcular_diferenca(dt1, agora)
+
     try:
         qtd = int(nota["qtd_bipagens"]) if nota["qtd_bipagens"] is not None else 1
     except Exception:
@@ -593,10 +627,11 @@ def api_exportar():
     wb.save(stream)
     stream.seek(0)
 
+    nome = f"Relatorio_Portaria_{agora_local().strftime('%Y%m%d_%H%M%S')}.xlsx"
     return send_file(
         stream,
         as_attachment=True,
-        download_name=f"Relatorio_Portaria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        download_name=nome,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
