@@ -13,7 +13,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import openpyxl
 
-# Fuso horário local (corrige diferença de hora no Render)
+# =========================
+# FUSO HORÁRIO LOCAL
+# =========================
 try:
     from zoneinfo import ZoneInfo
     LOCAL_TZ = ZoneInfo(os.getenv("APP_TZ", "America/Sao_Paulo"))
@@ -21,7 +23,7 @@ except Exception:
     LOCAL_TZ = timezone(timedelta(hours=-3))
 
 app = Flask(__name__)
-application = app  # compatível com gunicorn app:application
+application = app  # para gunicorn app:application
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "bipagem_nfe.db")
@@ -29,17 +31,13 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config_bipagem.json")
 
 
 # =========================
-# Helpers de data/hora
+# HELPERS
 # =========================
 def agora_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
 
 def parse_dt_banco(valor: str):
-    """
-    Converte ISO do banco para datetime com fuso local.
-    Aceita registros antigos sem tzinfo.
-    """
     if not valor:
         return None
     try:
@@ -55,7 +53,7 @@ def parse_dt_banco(valor: str):
 
 
 # =========================
-# Banco
+# BANCO
 # =========================
 def obter_conexao():
     conn = sqlite3.connect(DB_NAME)
@@ -88,7 +86,6 @@ def inicializar_banco():
     """)
     conn.commit()
 
-    # Migração para banco antigo
     c.execute("PRAGMA table_info(notas)")
     cols = [x["name"] for x in c.fetchall()]
     needed = {
@@ -115,7 +112,7 @@ def inicializar_banco():
 
 
 # =========================
-# Regras
+# REGRAS
 # =========================
 def sanitizar_e_extrair_chave(texto):
     nums = re.sub(r"\D", "", texto or "")
@@ -223,6 +220,7 @@ HTML = """<!DOCTYPE html>
   <style>
     body{background:#f3f4f6;font-family:'Segoe UI',sans-serif;}
     .barra-input{font-size:1.4rem;font-family:monospace;font-weight:bold;}
+    .top-filtro .form-control{max-width:360px;}
   </style>
 </head>
 <body>
@@ -252,11 +250,28 @@ HTML = """<!DOCTYPE html>
         <h5 class="text-secondary fw-bold mb-0">🔎 Histórico de Registros e Desvios</h5>
         <a href="/api/exportar" class="btn btn-success fw-bold">📊 Baixar Excel (.xlsx)</a>
       </div>
+
+      <!-- Filtro de pesquisa -->
+      <div class="d-flex align-items-center gap-2 mb-3 top-filtro">
+        <label for="buscaInput" class="fw-bold text-secondary mb-0">Buscar Chave / NF:</label>
+        <input id="buscaInput" type="text" class="form-control" placeholder="Digite a chave ou número da NF">
+        <button id="btnAtualizar" type="button" class="btn btn-outline-secondary fw-bold">Atualizar</button>
+      </div>
+
       <div class="table-responsive">
         <table class="table table-hover align-middle">
           <thead class="table-light">
             <tr class="text-center text-secondary small">
-              <th>NF</th><th>Chave de Acesso</th><th>1ª Bipagem</th><th>2ª Bipagem</th><th>Diferença</th><th>Status</th><th>Justificativa</th>
+              <th>NF</th>
+              <th>Chave de Acesso</th>
+              <th>Série</th>
+              <th>Data 1ª Bip</th>
+              <th>Hora 1ª Bip</th>
+              <th>Data 2ª Bip</th>
+              <th>Hora 2ª Bip</th>
+              <th>Diferença</th>
+              <th>Status</th>
+              <th>Justificativa</th>
             </tr>
           </thead>
           <tbody id="corpo"></tbody>
@@ -290,6 +305,9 @@ HTML = """<!DOCTYPE html>
       const btnRegistrar = document.getElementById('btnRegistrar');
       const btnLimpar = document.getElementById('btnLimpar');
       const btnSalvarJust = document.getElementById('btnSalvarJust');
+      const btnAtualizar = document.getElementById('btnAtualizar');
+      const buscaInput = document.getElementById('buscaInput');
+
       const painel = document.getElementById('painel');
       const corpo = document.getElementById('corpo');
       const descModal = document.getElementById('descModal');
@@ -303,7 +321,6 @@ HTML = """<!DOCTYPE html>
       let ultTime = 0;
       let processando = false;
 
-      // Relógio apenas visual (navegador)
       setInterval(() => {
         const d = new Date();
         document.getElementById('clock').innerText =
@@ -319,6 +336,10 @@ HTML = """<!DOCTYPE html>
         inputElem.value = "";
         ultChave = "";
         focar();
+      }
+
+      function getBusca() {
+        return (buscaInput.value || "").trim();
       }
 
       async function executarRequisicao(chave) {
@@ -383,7 +404,7 @@ HTML = """<!DOCTYPE html>
         if (!chave) return;
 
         const now = Date.now();
-        if (chave === ultChave && (now - ultTime < 2500)) return; // anti-rebote 2.5s
+        if (chave === ultChave && (now - ultTime < 2500)) return; // anti-rebote
 
         ultChave = chave;
         ultTime = now;
@@ -415,7 +436,8 @@ HTML = """<!DOCTYPE html>
 
       async function carregar() {
         try {
-          const res = await fetch('/api/historico');
+          const busca = encodeURIComponent(getBusca());
+          const res = await fetch('/api/historico?busca=' + busca);
           const lista = await res.json();
           corpo.innerHTML = "";
 
@@ -429,19 +451,33 @@ HTML = """<!DOCTYPE html>
             corpo.innerHTML += `<tr class="text-center">
               <td class="fw-bold">${n.numero_nf || '-'}</td>
               <td class="font-monospace small text-start">${n.chave || '-'}</td>
-              <td>${n.data_bip1 || '-'} ${n.hora_bip1 || ''}</td>
-              <td>${n.data_bip2 ? n.data_bip2 + ' ' + (n.hora_bip2 || '') : '-'}</td>
+              <td>${n.serie || '-'}</td>
+              <td>${n.data_bip1 || '-'}</td>
+              <td>${n.hora_bip1 || '-'}</td>
+              <td>${n.data_bip2 || '-'}</td>
+              <td>${n.hora_bip2 || '-'}</td>
               <td class="fw-bold">${n.tempo_decorrido || '-'}</td>
               <td>${st}</td>
               <td class="text-start small">${n.justificativa || '-'}</td>
             </tr>`;
           });
-        } catch (e) {}
+        } catch (e) {
+          console.log(e);
+        }
       }
 
+      // Eventos
       btnRegistrar.addEventListener('click', biparManual);
       btnLimpar.addEventListener('click', limpar);
       btnSalvarJust.addEventListener('click', salvarJust);
+      btnAtualizar.addEventListener('click', carregar);
+
+      buscaInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          carregar();
+        }
+      });
 
       inputElem.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -467,7 +503,7 @@ HTML = """<!DOCTYPE html>
 
 
 # =========================
-# Rotas
+# ROTAS
 # =========================
 @app.route("/")
 def index():
@@ -593,8 +629,29 @@ def api_justificar():
 
 @app.route("/api/historico")
 def api_historico():
+    busca = (request.args.get("busca") or "").strip()
+
     conn = obter_conexao()
-    rows = conn.execute("SELECT * FROM notas ORDER BY dt_completa_bip1 DESC").fetchall()
+    c = conn.cursor()
+
+    if busca:
+        like = f"%{busca}%"
+        c.execute("""
+            SELECT *
+            FROM notas
+            WHERE chave LIKE ?
+               OR numero_nf LIKE ?
+               OR serie LIKE ?
+               OR IFNULL(status, '') LIKE ?
+               OR IFNULL(justificativa, '') LIKE ?
+               OR IFNULL(data_bip1, '') LIKE ?
+               OR IFNULL(data_bip2, '') LIKE ?
+            ORDER BY dt_completa_bip1 DESC
+        """, (like, like, like, like, like, like, like))
+    else:
+        c.execute("SELECT * FROM notas ORDER BY dt_completa_bip1 DESC")
+
+    rows = c.fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
