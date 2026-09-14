@@ -23,7 +23,7 @@ except Exception:
     LOCAL_TZ = timezone(timedelta(hours=-3))
 
 app = Flask(__name__)
-application = app  # para gunicorn app:application
+application = app  # gunicorn app:application
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "bipagem_nfe.db")
@@ -44,7 +44,6 @@ def parse_dt_banco(valor: str):
         dt = datetime.fromisoformat(valor)
     except Exception:
         return None
-
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=LOCAL_TZ)
     else:
@@ -52,70 +51,18 @@ def parse_dt_banco(valor: str):
     return dt
 
 
-# =========================
-# BANCO
-# =========================
-def obter_conexao():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+def only_digits(s):
+    return re.sub(r"\D", "", str(s or ""))
 
 
-def inicializar_banco():
-    conn = obter_conexao()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS notas (
-            chave TEXT PRIMARY KEY,
-            numero_nf TEXT,
-            serie TEXT,
-            data_bip1 TEXT,
-            hora_bip1 TEXT,
-            dt_completa_bip1 TEXT,
-            data_bip2 TEXT,
-            hora_bip2 TEXT,
-            dt_completa_bip2 TEXT,
-            tempo_decorrido TEXT,
-            minutos_decorridos REAL,
-            status TEXT,
-            justificativa TEXT,
-            qtd_bipagens INTEGER DEFAULT 1,
-            observacao TEXT,
-            email_desvio_enviado INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-
-    c.execute("PRAGMA table_info(notas)")
-    cols = [x["name"] for x in c.fetchall()]
-    needed = {
-        "data_bip2": "TEXT",
-        "hora_bip2": "TEXT",
-        "dt_completa_bip2": "TEXT",
-        "tempo_decorrido": "TEXT",
-        "minutos_decorridos": "REAL",
-        "status": "TEXT",
-        "justificativa": "TEXT",
-        "qtd_bipagens": "INTEGER DEFAULT 1",
-        "observacao": "TEXT",
-        "email_desvio_enviado": "INTEGER DEFAULT 0",
-    }
-    for col, typ in needed.items():
-        if col not in cols:
-            try:
-                c.execute(f"ALTER TABLE notas ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    conn.commit()
-    conn.close()
+def normalizar_header(s):
+    s = str(s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-# =========================
-# REGRAS
-# =========================
 def sanitizar_e_extrair_chave(texto):
-    nums = re.sub(r"\D", "", texto or "")
+    nums = only_digits(texto)
     if len(nums) >= 44:
         chave = nums[:44]
         try:
@@ -146,6 +93,85 @@ def calcular_diferenca(dt1, dt2):
     return " ".join(partes), round(s / 60.0, 2)
 
 
+# =========================
+# BANCO
+# =========================
+def obter_conexao():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def inicializar_banco():
+    conn = obter_conexao()
+    c = conn.cursor()
+
+    # Tabela operacional (visível no histórico)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notas (
+            chave TEXT PRIMARY KEY,
+            numero_nf TEXT,
+            serie TEXT,
+            data_bip1 TEXT,
+            hora_bip1 TEXT,
+            dt_completa_bip1 TEXT,
+            data_bip2 TEXT,
+            hora_bip2 TEXT,
+            dt_completa_bip2 TEXT,
+            tempo_decorrido TEXT,
+            minutos_decorridos REAL,
+            status TEXT,
+            justificativa TEXT,
+            qtd_bipagens INTEGER DEFAULT 1,
+            observacao TEXT,
+            email_desvio_enviado INTEGER DEFAULT 0
+        )
+    """)
+
+    # Tabela oculta de comparação (NÃO entra no histórico)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS base_comparacao (
+            chave TEXT PRIMARY KEY,
+            numero_nf TEXT,
+            serie TEXT,
+            data_ref TEXT,
+            hora_ref TEXT,
+            origem_arquivo TEXT,
+            importado_em TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_base_comp_nf ON base_comparacao(numero_nf)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_base_comp_serie ON base_comparacao(serie)")
+
+    # Migração de notas antigas
+    c.execute("PRAGMA table_info(notas)")
+    cols = [x["name"] for x in c.fetchall()]
+    needed = {
+        "data_bip2": "TEXT",
+        "hora_bip2": "TEXT",
+        "dt_completa_bip2": "TEXT",
+        "tempo_decorrido": "TEXT",
+        "minutos_decorridos": "REAL",
+        "status": "TEXT",
+        "justificativa": "TEXT",
+        "qtd_bipagens": "INTEGER DEFAULT 1",
+        "observacao": "TEXT",
+        "email_desvio_enviado": "INTEGER DEFAULT 0",
+    }
+    for col, typ in needed.items():
+        if col not in cols:
+            try:
+                c.execute(f"ALTER TABLE notas ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# E-MAIL
+# =========================
 def carregar_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -208,6 +234,108 @@ def template_email_desvio(dados):
 
 
 # =========================
+# IMPORTAÇÃO BASE COMPARAÇÃO
+# =========================
+def detectar_colunas_base(ws):
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    hnorm = [normalizar_header(h) for h in headers]
+
+    def find_col(cands):
+        for i, h in enumerate(hnorm, start=1):
+            for c in cands:
+                if h == c or c in h:
+                    return i
+        return None
+
+    col_chave = find_col(["chave", "chave de acesso", "chave_acesso"])
+    col_nf = find_col(["numero nf", "número nf", "numero_nf", "nf"])
+    col_serie = find_col(["serie", "série"])
+    col_data = find_col(["data"])
+    col_hora = find_col(["hora"])
+
+    return {
+        "chave": col_chave,
+        "numero_nf": col_nf,
+        "serie": col_serie,
+        "data": col_data,
+        "hora": col_hora,
+    }
+
+
+def extrair_registros_base(ws, colmap):
+    validos = []
+    rejeitados = []
+
+    vistos = set()
+    for r in range(2, ws.max_row + 1):
+        raw_chave = ws.cell(r, colmap["chave"]).value if colmap["chave"] else None
+        dig = only_digits(raw_chave)
+
+        if not dig:
+            rejeitados.append({"linha": r, "motivo": "CHAVE_VAZIA", "valor": raw_chave})
+            continue
+        if len(dig) != 44:
+            rejeitados.append({"linha": r, "motivo": "CHAVE_INVALIDA_TAMANHO", "valor": raw_chave, "digitos": len(dig)})
+            continue
+        if dig in vistos:
+            # duplicidade no próprio arquivo
+            continue
+        vistos.add(dig)
+
+        nf = ws.cell(r, colmap["numero_nf"]).value if colmap["numero_nf"] else None
+        serie = ws.cell(r, colmap["serie"]).value if colmap["serie"] else None
+        data_ref = ws.cell(r, colmap["data"]).value if colmap["data"] else None
+        hora_ref = ws.cell(r, colmap["hora"]).value if colmap["hora"] else None
+
+        # normaliza NF
+        if nf is not None:
+            try:
+                if isinstance(nf, (int, float)):
+                    nf = str(int(nf))
+                else:
+                    nf = str(nf).strip()
+            except Exception:
+                nf = str(nf)
+
+        # deriva série da chave se não vier
+        if serie in (None, ""):
+            serie = dig[22:25]
+            try:
+                serie = str(int(serie))
+            except Exception:
+                pass
+        else:
+            try:
+                if isinstance(serie, (int, float)):
+                    serie = str(int(serie))
+                else:
+                    serie = str(serie).strip()
+            except Exception:
+                serie = str(serie)
+
+        # padroniza data/hora text
+        if isinstance(data_ref, datetime):
+            data_ref = data_ref.strftime("%d/%m/%Y")
+        elif data_ref is not None:
+            data_ref = str(data_ref).strip()
+
+        if isinstance(hora_ref, datetime):
+            hora_ref = hora_ref.strftime("%H:%M:%S")
+        elif hora_ref is not None:
+            hora_ref = str(hora_ref).strip()
+
+        validos.append({
+            "chave": dig,
+            "numero_nf": nf or "",
+            "serie": serie or "",
+            "data_ref": data_ref or "",
+            "hora_ref": hora_ref or "",
+        })
+
+    return validos, rejeitados
+
+
+# =========================
 # HTML
 # =========================
 HTML = """<!DOCTYPE html>
@@ -251,7 +379,6 @@ HTML = """<!DOCTYPE html>
         <a href="/api/exportar" class="btn btn-success fw-bold">📊 Baixar Excel (.xlsx)</a>
       </div>
 
-      <!-- Filtro de pesquisa -->
       <div class="d-flex align-items-center gap-2 mb-3 top-filtro">
         <label for="buscaInput" class="fw-bold text-secondary mb-0">Buscar Chave / NF:</label>
         <input id="buscaInput" type="text" class="form-control" placeholder="Digite a chave ou número da NF">
@@ -327,20 +454,9 @@ HTML = """<!DOCTYPE html>
           d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR');
       }, 1000);
 
-      function focar() {
-        inputElem.focus();
-        inputElem.select();
-      }
-
-      function limpar() {
-        inputElem.value = "";
-        ultChave = "";
-        focar();
-      }
-
-      function getBusca() {
-        return (buscaInput.value || "").trim();
-      }
+      function focar() { inputElem.focus(); inputElem.select(); }
+      function limpar() { inputElem.value = ""; ultChave = ""; focar(); }
+      function getBusca() { return (buscaInput.value || "").trim(); }
 
       async function executarRequisicao(chave) {
         processando = true;
@@ -402,10 +518,8 @@ HTML = """<!DOCTYPE html>
         if (processando) return;
         const chave = inputElem.value.trim();
         if (!chave) return;
-
         const now = Date.now();
-        if (chave === ultChave && (now - ultTime < 2500)) return; // anti-rebote
-
+        if (chave === ultChave && (now - ultTime < 2500)) return;
         ultChave = chave;
         ultTime = now;
         executarRequisicao(chave);
@@ -466,7 +580,6 @@ HTML = """<!DOCTYPE html>
         }
       }
 
-      // Eventos
       btnRegistrar.addEventListener('click', biparManual);
       btnLimpar.addEventListener('click', limpar);
       btnSalvarJust.addEventListener('click', salvarJust);
@@ -488,9 +601,7 @@ HTML = """<!DOCTYPE html>
 
       inputElem.addEventListener('input', (e) => {
         const v = e.target.value.replace(/\\D/g, '');
-        if (v.length === 44 && v !== ultChave) {
-          setTimeout(biparAutomatico, 200);
-        }
+        if (v.length === 44 && v !== ultChave) setTimeout(biparAutomatico, 200);
       });
 
       carregar();
@@ -524,15 +635,22 @@ def api_bipar():
 
     conn = obter_conexao()
     c = conn.cursor()
+
+    # comparação na base oculta
+    c.execute("SELECT 1 FROM base_comparacao WHERE chave = ?", (d["chave"],))
+    existe_base_comp = c.fetchone() is not None
+
     c.execute("SELECT * FROM notas WHERE chave = ?", (d["chave"],))
     nota = c.fetchone()
+
+    obs = "BASE_COMPARACAO" if existe_base_comp else None
 
     if not nota:
         c.execute("""
             INSERT INTO notas
-            (chave, numero_nf, serie, data_bip1, hora_bip1, dt_completa_bip1, status, justificativa, qtd_bipagens)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-        """, (d["chave"], d["numero_nf"], d["serie"], dt_str, hr_str, iso_str, "REGULAR", ""))
+            (chave, numero_nf, serie, data_bip1, hora_bip1, dt_completa_bip1, status, justificativa, qtd_bipagens, observacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """, (d["chave"], d["numero_nf"], d["serie"], dt_str, hr_str, iso_str, "REGULAR", "", obs))
         conn.commit()
         conn.close()
 
@@ -544,14 +662,12 @@ def api_bipar():
                 "numero_nf": d["numero_nf"],
                 "serie": d["serie"],
                 "data_bip1": dt_str,
-                "hora_bip1": hr_str
+                "hora_bip1": hr_str,
+                "na_base_comparacao": existe_base_comp
             }
         })
 
-    dt1 = parse_dt_banco(nota["dt_completa_bip1"])
-    if dt1 is None:
-        dt1 = agora
-
+    dt1 = parse_dt_banco(nota["dt_completa_bip1"]) or agora
     tempo_txt, mins = calcular_diferenca(dt1, agora)
 
     try:
@@ -560,12 +676,16 @@ def api_bipar():
         qtd = 1
     qtd += 1
 
+    obs_update = nota["observacao"]
+    if existe_base_comp:
+        obs_update = "BASE_COMPARACAO"
+
     c.execute("""
         UPDATE notas
         SET data_bip2=?, hora_bip2=?, dt_completa_bip2=?,
-            tempo_decorrido=?, minutos_decorridos=?, status=?, qtd_bipagens=?
+            tempo_decorrido=?, minutos_decorridos=?, status=?, qtd_bipagens=?, observacao=?
         WHERE chave=?
-    """, (dt_str, hr_str, iso_str, tempo_txt, mins, "DESVIO PENDENTE JUSTIFICATIVA", qtd, d["chave"]))
+    """, (dt_str, hr_str, iso_str, tempo_txt, mins, "DESVIO PENDENTE JUSTIFICATIVA", qtd, obs_update, d["chave"]))
     conn.commit()
     conn.close()
 
@@ -580,7 +700,8 @@ def api_bipar():
             "hora_bip1": nota["hora_bip1"],
             "data_bip2": dt_str,
             "hora_bip2": hr_str,
-            "tempo_decorrido": tempo_txt
+            "tempo_decorrido": tempo_txt,
+            "na_base_comparacao": existe_base_comp
         }
     })
 
@@ -630,7 +751,6 @@ def api_justificar():
 @app.route("/api/historico")
 def api_historico():
     busca = (request.args.get("busca") or "").strip()
-
     conn = obter_conexao()
     c = conn.cursor()
 
@@ -691,6 +811,145 @@ def api_exportar():
         download_name=nome,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ==========================================
+# ROTA NOVA: IMPORTAR BASE OCULTA DE COMPARAÇÃO
+# ==========================================
+@app.route("/api/importar-base-comparacao", methods=["POST"])
+def api_importar_base_comparacao():
+    """
+    multipart/form-data:
+      - arquivo: .xlsx
+      - aba (opcional): nome da aba
+    """
+    if "arquivo" not in request.files:
+        return jsonify({"sucesso": False, "mensagem": "Envie o arquivo no campo 'arquivo'."}), 400
+
+    arq = request.files["arquivo"]
+    nome_arquivo = (arq.filename or "arquivo.xlsx").strip()
+    aba_req = (request.form.get("aba") or "").strip()
+
+    if not nome_arquivo.lower().endswith(".xlsx"):
+        return jsonify({"sucesso": False, "mensagem": "Formato inválido. Envie .xlsx"}), 400
+
+    try:
+        wb = openpyxl.load_workbook(arq, data_only=True)
+    except Exception as e:
+        return jsonify({"sucesso": False, "mensagem": f"Falha ao ler Excel: {e}"}), 400
+
+    if aba_req:
+        if aba_req not in wb.sheetnames:
+            return jsonify({"sucesso": False, "mensagem": f"Aba '{aba_req}' não encontrada. Abas: {', '.join(wb.sheetnames)}"}), 400
+        ws = wb[aba_req]
+    else:
+        ws = wb[wb.sheetnames[0]]
+
+    colmap = detectar_colunas_base(ws)
+    if not colmap["chave"]:
+        return jsonify({
+            "sucesso": False,
+            "mensagem": "Não encontrei coluna de CHAVE. Esperado cabeçalho como: Chave / Chave de Acesso."
+        }), 400
+
+    validos, rejeitados = extrair_registros_base(ws, colmap)
+
+    if not validos:
+        return jsonify({
+            "sucesso": False,
+            "mensagem": "Nenhum registro válido (chave de 44 dígitos) encontrado para importar.",
+            "rejeitados": len(rejeitados)
+        }), 400
+
+    agora_iso = agora_local().isoformat()
+
+    conn = obter_conexao()
+    c = conn.cursor()
+    inseridos = 0
+    atualizados = 0
+
+    try:
+        for row in validos:
+            # verifica existência para métrica
+            c.execute("SELECT 1 FROM base_comparacao WHERE chave = ?", (row["chave"],))
+            existe = c.fetchone() is not None
+
+            c.execute("""
+                INSERT INTO base_comparacao
+                (chave, numero_nf, serie, data_ref, hora_ref, origem_arquivo, importado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chave) DO UPDATE SET
+                  numero_nf=excluded.numero_nf,
+                  serie=excluded.serie,
+                  data_ref=excluded.data_ref,
+                  hora_ref=excluded.hora_ref,
+                  origem_arquivo=excluded.origem_arquivo,
+                  importado_em=excluded.importado_em
+            """, (
+                row["chave"], row["numero_nf"], row["serie"],
+                row["data_ref"], row["hora_ref"], nome_arquivo, agora_iso
+            ))
+
+            if existe:
+                atualizados += 1
+            else:
+                inseridos += 1
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"sucesso": False, "mensagem": f"Falha na importação: {e}"}), 500
+
+    conn.close()
+
+    return jsonify({
+        "sucesso": True,
+        "mensagem": "Base de comparação importada com sucesso.",
+        "arquivo": nome_arquivo,
+        "aba": ws.title,
+        "linhas_validas": len(validos),
+        "inseridos": inseridos,
+        "atualizados": atualizados,
+        "rejeitados": len(rejeitados),
+        "exemplos_rejeitados": rejeitados[:10],
+        "colunas_detectadas": colmap
+    })
+
+
+# rota opcional para conferência administrativa
+@app.route("/api/base-comparacao/resumo")
+def api_base_comparacao_resumo():
+    conn = obter_conexao()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) AS total FROM base_comparacao")
+    total = c.fetchone()["total"]
+
+    c.execute("""
+        SELECT origem_arquivo, importado_em
+        FROM base_comparacao
+        ORDER BY importado_em DESC
+        LIMIT 1
+    """)
+    last = c.fetchone()
+    conn.close()
+
+    return jsonify({
+        "sucesso": True,
+        "total_registros_base": total,
+        "ultimo_arquivo": (last["origem_arquivo"] if last else None),
+        "ultimo_importado_em": (last["importado_em"] if last else None)
+    })
+
+
+@app.route("/api/base-comparacao/limpar", methods=["POST"])
+def api_base_comparacao_limpar():
+    conn = obter_conexao()
+    c = conn.cursor()
+    c.execute("DELETE FROM base_comparacao")
+    conn.commit()
+    conn.close()
+    return jsonify({"sucesso": True, "mensagem": "Base de comparação limpa com sucesso."})
 
 
 # Inicializa banco no import
