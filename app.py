@@ -102,4 +102,313 @@ def enviar_email_smtp(assunto, corpo_html, destinatarios):
         return True
     except: return False
 
-def template_email_desvio(
+def template_email_desvio(dados):
+    return f"""
+    <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+        <div style="background-color: #DC2626; color: white; padding: 15px; border-radius: 6px; text-align: center;">
+            <h2 style="margin: 0;">⚠️ ALERTA DE DESVIO: DUPLA BIPAGEM NA PORTARIA</h2>
+            <p style="margin: 5px 0 0 0;">Nota Fiscal: {dados.get('numero_nf')} | Série: {dados.get('serie')}</p>
+        </div>
+        <div style="padding: 20px; border: 1px solid #e5e7eb; border-radius: 6px; margin-top: 15px;">
+            <p><strong>Chave de Acesso:</strong> <code style="font-size: 11px;">{dados.get('chave')}</code></p>
+            <p><strong>1ª Bipagem (Entrada):</strong> {dados.get('data_bip1')} às {dados.get('hora_bip1')}</p>
+            <p><strong>2ª Bipagem (Duplicada):</strong> <span style="color: #DC2626; font-weight: bold;">{dados.get('data_bip2')} às {dados.get('hora_bip2')}</span></p>
+            <p><strong>Diferença de Tempo:</strong> ⏱️ <b>{dados.get('tempo_decorrido')}</b></p>
+            <p><strong>Justificativa:</strong> {dados.get('justificativa', 'Pendente')}</p>
+        </div>
+    </div>
+    """
+
+HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portaria Web • Controle de NF-e</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>body{background:#f3f4f6;font-family:'Segoe UI',sans-serif;}.barra-input{font-size:1.4rem;font-family:monospace;font-weight:bold;}</style>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-primary mb-4 shadow-sm">
+        <div class="container-fluid px-4">
+            <span class="navbar-brand fw-bold">🚪 PORTARIA WEB • CONTROLE DE SAÍDAS DE NF-e</span>
+            <span class="text-white-50 fw-bold" id="clock"></span>
+        </div>
+    </nav>
+    <div class="container-fluid px-4">
+        <div class="card p-4 mb-4 border-0 shadow-sm">
+            <h5 class="text-secondary fw-bold mb-3">⚡ Leitura de Código de Barras (Chave de 44 dígitos)</h5>
+            <div class="input-group mb-3">
+                <input type="text" id="chaveInput" class="form-control barra-input text-center" placeholder="Aponte o leitor de código de barras aqui..." autofocus autocomplete="off">
+                <button class="btn btn-primary px-4 fw-bold" onclick="biparManual()">Registrar</button>
+                <button class="btn btn-outline-secondary px-4 fw-bold" onclick="limpar()">Limpar</button>
+            </div>
+            <div id="painel" class="alert alert-light border text-center my-0 py-3 fw-bold text-success">🟢 Leitor Pronto para Bipagem</div>
+        </div>
+        <div class="card p-4 border-0 shadow-sm">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h5 class="text-secondary fw-bold mb-0">🔎 Histórico de Registros e Desvios</h5>
+                <a href="/api/exportar" class="btn btn-success fw-bold">📊 Baixar Excel (.xlsx)</a>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover align-middle"><thead class="table-light"><tr class="text-center text-secondary small">
+                    <th>NF</th><th>Chave de Acesso</th><th>1ª Bipagem</th><th>2ª Bipagem</th><th>Diferença</th><th>Status</th><th>Justificativa</th>
+                </tr></thead><tbody id="corpo"></tbody></table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal Justificativa -->
+    <div class="modal fade" id="modalJust" tabindex="-1" data-bs-backdrop="static"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+        <div class="modal-header bg-danger text-white"><h5 class="modal-title fw-bold">⚠️ DUPLO REGISTRO IDENTIFICADO</h5></div>
+        <div class="modal-body">
+            <p id="descModal" class="mb-3"></p>
+            <label class="form-label fw-bold">Informe o motivo da 2ª bipagem (Obrigatório):</label>
+            <textarea id="justInput" class="form-control" rows="3" placeholder="Digite aqui..."></textarea>
+        </div>
+        <div class="modal-footer"><button id="btnSalvarJust" type="button" class="btn btn-danger fw-bold w-100" onclick="salvarJust()">Gravar Justificativa e Enviar E-mail</button></div>
+    </div></div></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let modal = new bootstrap.Modal(document.getElementById('modalJust'));
+        let chaveDesvio = "", ultChave = "", ultTime = 0, processando = false;
+        
+        setInterval(() => document.getElementById('clock').innerText = new Date().toLocaleDateString() + ' ' + new Date().toLocaleTimeString(), 1000);
+        
+        function focar(){ const i = document.getElementById('chaveInput'); i.focus(); i.select(); }
+        function limpar(){ document.getElementById('chaveInput').value = ""; ultChave = ""; focar(); }
+        
+        const inputElem = document.getElementById('chaveInput');
+        
+        // Disparo por teclado/leitor (Enter)
+        inputElem.addEventListener('keydown', e => { 
+            if (e.key === 'Enter') { 
+                e.preventDefault(); 
+                biparAutomatico(); 
+            } 
+        });
+        
+        // Disparo Automático por limite de caracteres
+        inputElem.addEventListener('input', e => {
+            let v = e.target.value.replace(/\D/g, '');
+            if(v.length === 44 && v !== ultChave) {
+                setTimeout(biparAutomatico, 200);
+            }
+        });
+
+        // Função do botão (Ignora regras de bloqueio de tempo)
+        function biparManual() {
+            processando = false; // Força destravar
+            ultChave = "";       // Ignora validação de duplicata no Front
+            const chave = inputElem.value.trim();
+            if(!chave) {
+                alert("Por favor, bip a nota fiscal ou cole a chave primeiro!");
+                focar();
+                return;
+            }
+            executarRequisicao(chave);
+        }
+
+        // Função do leitor de código (Com proteção anti-rebote)
+        function biparAutomatico() {
+            if(processando) return;
+            const chave = inputElem.value.trim();
+            if (!chave) return;
+            
+            const now = Date.now();
+            if (chave === ultChave && (now - ultTime < 2500)) return; // Anti-rebote 2.5s
+            
+            ultChave = chave; ultTime = now;
+            executarRequisicao(chave);
+        }
+
+        // Motor principal de requisição
+        async function executarRequisicao(chave) {
+            processando = true;
+            const p = document.getElementById('painel');
+            p.className = "alert alert-warning border text-center my-0 py-3 fw-bold";
+            p.innerText = "⏳ Processando...";
+
+            try {
+                const res = await fetch('/api/bipar', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({chave: chave}) });
+                
+                if (!res.ok) throw new Error("Erro no servidor (" + res.status + ")");
+                
+                const data = await res.json();
+                
+                if (!data.sucesso) { 
+                    p.className = "alert alert-danger border text-center my-0 py-3 fw-bold"; 
+                    p.innerText = "❌ " + data.mensagem; 
+                } else if (data.tipo === "1ª Bipagem") {
+                    p.className = "alert alert-primary border text-center my-0 py-3 fw-bold";
+                    p.innerText = "✅ 1ª Bipagem Gravada: NF " + data.dados.numero_nf + " às " + data.dados.hora_bip1;
+                    inputElem.value = ""; // Limpa a barra para a próxima
+                } else {
+                    p.className = "alert alert-danger border text-center my-0 py-3 fw-bold";
+                    p.innerText = "🚨 ALERTA DE DESVIO: NF " + data.dados.numero_nf + " | Tempo: " + data.dados.tempo_decorrido;
+                    chaveDesvio = data.dados.chave;
+                    document.getElementById('descModal').innerText = "A NF " + data.dados.numero_nf + " já registrou saída anterior.\nTempo decorrido: " + data.dados.tempo_decorrido;
+                    document.getElementById('justInput').value = "";
+                    document.getElementById('btnSalvarJust').innerText = "Gravar Justificativa e Enviar E-mail";
+                    document.getElementById('btnSalvarJust').disabled = false;
+                    modal.show();
+                }
+            } catch(e) {
+                console.error(e);
+                p.className = "alert alert-danger border text-center my-0 py-3 fw-bold";
+                p.innerText = "❌ Falha de comunicação. Verifique sua internet.";
+                ultChave = ""; // Permite tentar de novo
+            } finally {
+                processando = false;
+                carregar(); 
+                focar();
+            }
+        }
+
+        async function salvarJust(){
+            const just = document.getElementById('justInput').value.trim();
+            if (!just) return alert("Digite o motivo obrigatório.");
+            
+            const btn = document.getElementById('btnSalvarJust');
+            btn.disabled = true;
+            btn.innerText = "Salvando e Enviando E-mail...";
+            
+            try {
+                await fetch('/api/justificar', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({chave: chaveDesvio, justificativa: just}) });
+                inputElem.value = ""; // Limpa ao fechar a janela
+            } catch(e) { console.log(e); }
+            
+            modal.hide(); 
+            carregar(); 
+            focar();
+        }
+
+        async function carregar(){
+            try {
+                const res = await fetch('/api/historico');
+                const lista = await res.json();
+                const tbody = document.getElementById('corpo');
+                tbody.innerHTML = "";
+                lista.forEach(n => {
+                    let st = "";
+                    if(n.status.includes("DESVIO")) st = '<span class="badge bg-danger">🚨 DESVIO</span>';
+                    else if(n.status.includes("PENDENTE")) st = '<span class="badge bg-warning text-dark">⚠️ PENDENTE</span>';
+                    else st = '<span class="badge bg-success">REGULAR</span>';
+                    
+                    tbody.innerHTML += `<tr class="text-center"><td class="fw-bold">${n.numero_nf}</td><td class="font-monospace small text-start">${n.chave}</td><td>${n.data_bip1} ${n.hora_bip1}</td><td>${n.data_bip2 ? n.data_bip2 + ' ' + n.hora_bip2 : '-'}</td><td class="fw-bold">${n.tempo_decorrido || '-'}</td><td>${st}</td><td class="text-start small">${n.justificativa || '-'}</td></tr>`;
+                });
+            } catch(e){}
+        }
+        carregar(); focar();
+    </script>
+</body>
+</html>"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/bipar", methods=["POST"])
+def api_bipar():
+    chave_raw = (request.get_json() or {}).get("chave", "").strip()
+    d = sanitizar_e_extrair_chave(chave_raw)
+    if not d["valida"]:
+        return jsonify({"sucesso": False, "mensagem": f"Chave inválida ({len(d['chave'])} dígitos). Precisa ter 44."})
+    
+    agora = datetime.now()
+    dt_str, hr_str, iso_str = agora.strftime("%d/%m/%Y"), agora.strftime("%H:%M:%S"), agora.isoformat()
+    
+    conn = obter_conexao()
+    c = conn.cursor()
+    c.execute("SELECT * FROM notas WHERE chave = ?", (d["chave"],))
+    nota = c.fetchone()
+
+    if not nota:
+        c.execute("INSERT INTO notas (chave, numero_nf, serie, data_bip1, hora_bip1, dt_completa_bip1, status, justificativa, qtd_bipagens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                  (d["chave"], d["numero_nf"], d["serie"], dt_str, hr_str, iso_str, "REGULAR", ""))
+        conn.commit()
+        conn.close()
+        return jsonify({"sucesso": True, "tipo": "1ª Bipagem", "dados": {"chave": d["chave"], "numero_nf": d["numero_nf"], "serie": d["serie"], "data_bip1": dt_str, "hora_bip1": hr_str}})
+    else:
+        try: dt1 = datetime.fromisoformat(nota["dt_completa_bip1"] or iso_str)
+        except: dt1 = agora
+        tempo_txt, mins = calcular_diferenca(dt1, agora)
+        
+        try: qtd = int(nota["qtd_bipagens"]) if nota["qtd_bipagens"] is not None else 1
+        except: qtd = 1
+        qtd += 1
+        
+        c.execute("UPDATE notas SET data_bip2=?, hora_bip2=?, dt_completa_bip2=?, tempo_decorrido=?, minutos_decorridos=?, status=?, qtd_bipagens=? WHERE chave=?",
+                  (dt_str, hr_str, iso_str, tempo_txt, mins, "DESVIO PENDENTE JUSTIFICATIVA", qtd, d["chave"]))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            "sucesso": True, 
+            "tipo": "2ª Bipagem", 
+            "dados": {
+                "chave": d["chave"], "numero_nf": d["numero_nf"], "serie": d["serie"], 
+                "data_bip1": nota["data_bip1"], "hora_bip1": nota["hora_bip1"], 
+                "data_bip2": dt_str, "hora_bip2": hr_str, "tempo_decorrido": tempo_txt
+            }
+        })
+
+@app.route("/api/justificar", methods=["POST"])
+def api_just():
+    req = request.get_json() or {}
+    chave = req.get("chave")
+    justificativa = req.get("justificativa", "").strip()
+    
+    conn = obter_conexao()
+    c = conn.cursor()
+    c.execute("UPDATE notas SET justificativa = ?, status = 'DESVIO REGISTRADO' WHERE chave = ?", (justificativa, chave))
+    c.execute("SELECT * FROM notas WHERE chave = ?", (chave,))
+    row = c.fetchone()
+    conn.commit()
+    conn.close()
+    
+    if row:
+        def disparar_just():
+            cfg = carregar_config()
+            if cfg.get("destinatarios"):
+                payload = {
+                    "chave": chave, "numero_nf": row["numero_nf"], "serie": row["serie"],
+                    "data_bip1": row["data_bip1"], "hora_bip1": row["hora_bip1"],
+                    "data_bip2": row["data_bip2"], "hora_bip2": row["hora_bip2"],
+                    "tempo_decorrido": row["tempo_decorrido"], "justificativa": justificativa
+                }
+                assunto = f"[ALERTA DE DESVIO - JUSTIFICADO] NF {row['numero_nf']}"
+                html = template_email_desvio(payload)
+                enviar_email_smtp(assunto, html, cfg["destinatarios"])
+        threading.Thread(target=disparar_just, daemon=True).start()
+
+    return jsonify({"sucesso": True})
+
+@app.route("/api/historico")
+def api_hist():
+    conn = obter_conexao()
+    rows = conn.execute("SELECT * FROM notas ORDER BY dt_completa_bip1 DESC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/exportar")
+def api_exp():
+    conn = obter_conexao()
+    registros = conn.execute("SELECT * FROM notas ORDER BY dt_completa_bip1 DESC").fetchall()
+    conn.close()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Portaria"
+    headers = ["Chave de Acesso", "Número NF", "Série", "Data 1ª Bip", "Hora 1ª Bip", "Data 2ª Bip", "Hora 2ª Bip", "Diferença", "Status", "Justificativa"]
+    ws.append(headers)
+    for r in registros:
+        ws.append([r["chave"], r["numero_nf"], r["serie"], r["data_bip1"], r["hora_bip1"], r["data_bip2"] or "-", r["hora_bip2"] or "-", r["tempo_decorrido"] or "-", r["status"], r["justificativa"] or "-"])
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return send_file(stream, as_attachment=True, download_name=f"Relatorio_Portaria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+if __name__ == "__main__":
+    inicializar_banco()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
