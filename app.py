@@ -1,3 +1,4 @@
+app = Flask(__name__)
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -240,3 +241,4 @@ HTML = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
+application = app
