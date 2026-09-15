@@ -5,6 +5,7 @@ import json
 import sqlite3
 import smtplib
 import threading
+from functools import wraps
 from io import BytesIO
 from datetime import datetime, date, time, timezone, timedelta
 
@@ -14,7 +15,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # =========================================================
-# APP / FUSO
+# FUSO / APP
 # =========================================================
 try:
     from zoneinfo import ZoneInfo
@@ -28,6 +29,20 @@ application = app  # gunicorn app:application
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "bipagem_nfe.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config_bipagem.json")
+
+ENV = os.getenv("APP_ENV", "development").lower().strip()
+ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or "").strip()
+MAX_IMPORT_MB = int(os.getenv("MAX_IMPORT_MB", "15"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMPORT_MB * 1024 * 1024  # limite upload
+
+
+# =========================================================
+# FAIL-FAST CONFIG
+# =========================================================
+def validar_configuracao():
+    # Em produção, exige chave administrativa para rotas sensíveis
+    if ENV == "production" and not ADMIN_API_KEY:
+        raise RuntimeError("ADMIN_API_KEY ausente em produção. Abortando boot por segurança.")
 
 
 # =========================================================
@@ -54,7 +69,6 @@ def parse_iso_db(value: str):
         dt = datetime.fromisoformat(value)
     except Exception:
         return None
-
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=LOCAL_TZ)
     else:
@@ -63,14 +77,10 @@ def parse_iso_db(value: str):
 
 
 def parse_data_hora_ref(data_ref, hora_ref):
-    """
-    Converte data/hora vinda da base de comparação (Excel/Texto)
-    para datetime com fuso LOCAL_TZ.
-    """
     if data_ref in (None, ""):
         return None
 
-    # Caso Excel tenha vindo como datetime/date
+    # Tipos Excel
     if isinstance(data_ref, datetime):
         d = data_ref.date()
     elif isinstance(data_ref, date):
@@ -78,19 +88,18 @@ def parse_data_hora_ref(data_ref, hora_ref):
     else:
         d = None
 
-    # Hora pode vir como datetime/time/str
     if isinstance(hora_ref, datetime):
         h = hora_ref.time().replace(microsecond=0)
     elif isinstance(hora_ref, time):
         h = hora_ref.replace(microsecond=0)
     elif isinstance(hora_ref, str) and hora_ref.strip():
-        txt = hora_ref.strip()
+        h = None
         for fmt in ("%H:%M:%S", "%H:%M"):
             try:
-                h = datetime.strptime(txt, fmt).time()
+                h = datetime.strptime(hora_ref.strip(), fmt).time()
                 break
             except Exception:
-                h = None
+                pass
     else:
         h = None
 
@@ -99,14 +108,13 @@ def parse_data_hora_ref(data_ref, hora_ref):
             h = time(0, 0, 0)
         return datetime.combine(d, h).replace(tzinfo=LOCAL_TZ)
 
-    # Se data veio como string
     data_txt = str(data_ref).strip()
     hora_txt = str(hora_ref or "").strip() or "00:00:00"
 
     candidatos = [
         f"{data_txt} {hora_txt}",
         f"{data_txt} 00:00:00",
-        data_txt,  # pode vir só data
+        data_txt
     ]
     formatos = [
         "%d/%m/%Y %H:%M:%S",
@@ -120,10 +128,10 @@ def parse_data_hora_ref(data_ref, hora_ref):
     for txt in candidatos:
         for fmt in formatos:
             try:
-                dt = datetime.strptime(txt, fmt)
-                return dt.replace(tzinfo=LOCAL_TZ)
+                return datetime.strptime(txt, fmt).replace(tzinfo=LOCAL_TZ)
             except Exception:
                 pass
+
     return None
 
 
@@ -172,7 +180,6 @@ def inicializar_banco():
     conn = obter_conexao()
     c = conn.cursor()
 
-    # Tabela operacional (visível no histórico)
     c.execute("""
         CREATE TABLE IF NOT EXISTS notas (
             chave TEXT PRIMARY KEY,
@@ -194,7 +201,6 @@ def inicializar_banco():
         )
     """)
 
-    # Tabela oculta de comparação (não exibida no histórico)
     c.execute("""
         CREATE TABLE IF NOT EXISTS base_comparacao (
             chave TEXT PRIMARY KEY,
@@ -207,13 +213,39 @@ def inicializar_banco():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            correlation_id TEXT,
+            details_json TEXT
+        )
+    """)
+
+    # imutabilidade lógica (append-only)
+    c.execute("""
+        CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+        BEFORE UPDATE ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log is append-only');
+        END;
+    """)
+    c.execute("""
+        CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+        BEFORE DELETE ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log is append-only');
+        END;
+    """)
+
     c.execute("CREATE INDEX IF NOT EXISTS idx_base_comp_nf ON base_comparacao(numero_nf)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_base_comp_serie ON base_comparacao(serie)")
 
-    # Migração de colunas antigas na tabela notas
+    # Migração de colunas antigas em notas
     c.execute("PRAGMA table_info(notas)")
     cols = [x["name"] for x in c.fetchall()]
-
     needed = {
         "data_bip2": "TEXT",
         "hora_bip2": "TEXT",
@@ -226,7 +258,6 @@ def inicializar_banco():
         "observacao": "TEXT",
         "email_desvio_enviado": "INTEGER DEFAULT 0",
     }
-
     for col, typ in needed.items():
         if col not in cols:
             try:
@@ -238,31 +269,84 @@ def inicializar_banco():
     conn.close()
 
 
+def audit_event(event_type, actor=None, correlation_id=None, details=None):
+    conn = obter_conexao()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO audit_log (event_type, actor, created_at, correlation_id, details_json)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            event_type,
+            actor or "anonymous",
+            agora_local().isoformat(),
+            correlation_id or "",
+            json.dumps(details or {}, ensure_ascii=False)
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+# =========================================================
+# AUTORIZAÇÃO (DENY BY DEFAULT p/ rotas administrativas)
+# =========================================================
+def require_admin_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Em dev, permite sem chave para facilitar teste local
+        if ENV != "production":
+            return fn(*args, **kwargs)
+
+        provided = (request.headers.get("X-Admin-Key") or "").strip()
+        if not provided or provided != ADMIN_API_KEY:
+            audit_event(
+                event_type="admin_access_denied",
+                actor=request.remote_addr,
+                details={"path": request.path}
+            )
+            return jsonify({"sucesso": False, "mensagem": "Acesso negado."}), 403
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 # =========================================================
 # E-MAIL
 # =========================================================
 def carregar_config():
+    # fallback para config local (legado)
+    cfg = {
+        "destinatarios": [],
+        "smtp_server": os.getenv("SMTP_SERVER", "smtp.office365.com"),
+        "smtp_port": int(os.getenv("SMTP_PORT", "587")),
+        "email_remetente": os.getenv("EMAIL_REMETENTE", ""),
+        "senha_app": os.getenv("EMAIL_SENHA_APP", ""),
+    }
+
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                file_cfg = json.load(f)
+            # vars de ambiente têm prioridade
+            cfg.update(file_cfg or {})
+            cfg["smtp_server"] = os.getenv("SMTP_SERVER", cfg.get("smtp_server", "smtp.office365.com"))
+            cfg["smtp_port"] = int(os.getenv("SMTP_PORT", str(cfg.get("smtp_port", 587))))
+            cfg["email_remetente"] = os.getenv("EMAIL_REMETENTE", cfg.get("email_remetente", ""))
+            cfg["senha_app"] = os.getenv("EMAIL_SENHA_APP", cfg.get("senha_app", ""))
         except Exception:
             pass
-    return {
-        "destinatarios": [],
-        "smtp_server": "smtp.office365.com",
-        "smtp_port": 587,
-        "email_remetente": "",
-        "senha_app": "",
-    }
+
+    return cfg
 
 
 def enviar_email_smtp(assunto, corpo_html, destinatarios):
     cfg = carregar_config()
-    remetente = cfg.get("email_remetente", "").strip()
-    senha = cfg.get("senha_app", "").strip()
-    servidor = cfg.get("smtp_server", "smtp.office365.com").strip()
-
+    remetente = (cfg.get("email_remetente") or "").strip()
+    senha = (cfg.get("senha_app") or "").strip()
+    servidor = (cfg.get("smtp_server") or "smtp.office365.com").strip()
     try:
         porta = int(cfg.get("smtp_port", 587))
     except Exception:
@@ -307,7 +391,7 @@ def template_email_desvio(dados):
 
 
 # =========================================================
-# IMPORTAÇÃO BASE OCULTA
+# IMPORT BASE HELPERS
 # =========================================================
 def detectar_colunas_base(ws):
     headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
@@ -341,13 +425,10 @@ def extrair_registros_base(ws, colmap):
         if not chave:
             rejeitados.append({"linha": r, "motivo": "CHAVE_VAZIA", "valor": raw})
             continue
-
         if len(chave) != 44:
             rejeitados.append({"linha": r, "motivo": "CHAVE_INVALIDA_TAMANHO", "valor": raw, "digitos": len(chave)})
             continue
-
         if chave in vistos:
-            # duplicidade no arquivo de carga
             continue
         vistos.add(chave)
 
@@ -356,29 +437,25 @@ def extrair_registros_base(ws, colmap):
         data_ref = ws.cell(r, colmap["data"]).value if colmap["data"] else None
         hora_ref = ws.cell(r, colmap["hora"]).value if colmap["hora"] else None
 
-        # NF
-        if nf is not None:
-            if isinstance(nf, (int, float)):
-                nf = str(int(nf))
-            else:
-                nf = str(nf).strip()
-        else:
+        if nf is None:
             nf = ""
+        elif isinstance(nf, (int, float)):
+            nf = str(int(nf))
+        else:
+            nf = str(nf).strip()
 
-        # Série
         if serie in (None, ""):
             serie = chave[22:25]
             try:
                 serie = str(int(serie))
             except Exception:
                 pass
+        elif isinstance(serie, (int, float)):
+            serie = str(int(serie))
         else:
-            if isinstance(serie, (int, float)):
-                serie = str(int(serie))
-            else:
-                serie = str(serie).strip()
+            serie = str(serie).strip()
 
-        # Data/Hora em texto
+        # preserva como texto para persistência
         if isinstance(data_ref, datetime):
             data_txt = data_ref.strftime("%d/%m/%Y")
         elif isinstance(data_ref, date):
@@ -409,7 +486,7 @@ def extrair_registros_base(ws, colmap):
 
 
 # =========================================================
-# HTML
+# HTML (mantido simples e funcional)
 # =========================================================
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -462,16 +539,8 @@ HTML = """<!DOCTYPE html>
         <table class="table table-hover align-middle">
           <thead class="table-light">
             <tr class="text-center text-secondary small">
-              <th>NF</th>
-              <th>Chave de Acesso</th>
-              <th>Série</th>
-              <th>Data 1ª Bip</th>
-              <th>Hora 1ª Bip</th>
-              <th>Data 2ª Bip</th>
-              <th>Hora 2ª Bip</th>
-              <th>Diferença</th>
-              <th>Status</th>
-              <th>Justificativa</th>
+              <th>NF</th><th>Chave de Acesso</th><th>Série</th><th>Data 1ª Bip</th><th>Hora 1ª Bip</th>
+              <th>Data 2ª Bip</th><th>Hora 2ª Bip</th><th>Diferença</th><th>Status</th><th>Justificativa</th>
             </tr>
           </thead>
           <tbody id="corpo"></tbody>
@@ -491,9 +560,7 @@ HTML = """<!DOCTYPE html>
         <textarea id="justInput" class="form-control" rows="3" placeholder="Digite aqui..."></textarea>
       </div>
       <div class="modal-footer">
-        <button id="btnSalvarJust" type="button" class="btn btn-danger fw-bold w-100">
-          Gravar Justificativa e Enviar E-mail
-        </button>
+        <button id="btnSalvarJust" type="button" class="btn btn-danger fw-bold w-100">Gravar Justificativa e Enviar E-mail</button>
       </div>
     </div></div>
   </div>
@@ -507,14 +574,11 @@ HTML = """<!DOCTYPE html>
       const btnSalvarJust = document.getElementById('btnSalvarJust');
       const btnAtualizar = document.getElementById('btnAtualizar');
       const buscaInput = document.getElementById('buscaInput');
-
       const painel = document.getElementById('painel');
       const corpo = document.getElementById('corpo');
       const descModal = document.getElementById('descModal');
       const justInput = document.getElementById('justInput');
-
-      const modalEl = document.getElementById('modalJust');
-      const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+      const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('modalJust'));
 
       let chaveDesvio = "";
       let ultChave = "";
@@ -523,154 +587,118 @@ HTML = """<!DOCTYPE html>
 
       setInterval(() => {
         const d = new Date();
-        document.getElementById('clock').innerText =
-          d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR');
+        document.getElementById('clock').innerText = d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR');
       }, 1000);
 
-      function focar() {
-        inputElem.focus();
-        inputElem.select();
+      function focar(){ inputElem.focus(); inputElem.select(); }
+      function limpar(){ inputElem.value=""; ultChave=""; focar(); }
+
+      async function carregar(){
+        const busca = encodeURIComponent((buscaInput.value || "").trim());
+        const res = await fetch('/api/historico?busca=' + busca);
+        const lista = await res.json();
+        corpo.innerHTML = "";
+        lista.forEach(n => {
+          let st = "";
+          const s = n.status || "";
+          if (s.includes("DESVIO")) st = '<span class="badge bg-danger">🚨 DESVIO</span>';
+          else if (s.includes("PENDENTE")) st = '<span class="badge bg-warning text-dark">⚠️ PENDENTE</span>';
+          else st = '<span class="badge bg-success">REGULAR</span>';
+
+          corpo.innerHTML += `<tr class="text-center">
+            <td class="fw-bold">${n.numero_nf || '-'}</td>
+            <td class="font-monospace small text-start">${n.chave || '-'}</td>
+            <td>${n.serie || '-'}</td>
+            <td>${n.data_bip1 || '-'}</td>
+            <td>${n.hora_bip1 || '-'}</td>
+            <td>${n.data_bip2 || '-'}</td>
+            <td>${n.hora_bip2 || '-'}</td>
+            <td class="fw-bold">${n.tempo_decorrido || '-'}</td>
+            <td>${st}</td>
+            <td class="text-start small">${n.justificativa || '-'}</td>
+          </tr>`;
+        });
       }
 
-      function limpar() {
-        inputElem.value = "";
-        ultChave = "";
-        focar();
-      }
-
-      function getBusca() {
-        return (buscaInput.value || "").trim();
-      }
-
-      async function executarRequisicao(chave) {
+      async function executarRequisicao(chave){
         processando = true;
         painel.className = "alert alert-warning border text-center my-0 py-3 fw-bold";
         painel.innerText = "⏳ Processando...";
 
-        try {
+        try{
           const res = await fetch('/api/bipar', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
             body: JSON.stringify({chave})
           });
-
           const data = await res.json();
 
-          if (!res.ok || !data.sucesso) {
+          if (!res.ok || !data.sucesso){
             painel.className = "alert alert-danger border text-center my-0 py-3 fw-bold";
             painel.innerText = "❌ " + (data.mensagem || "Falha no processamento.");
-          } else if (data.tipo === "1ª Bipagem") {
+          } else if (data.tipo === "1ª Bipagem"){
             painel.className = "alert alert-primary border text-center my-0 py-3 fw-bold";
             painel.innerText = "✅ 1ª Bipagem Gravada: NF " + data.dados.numero_nf + " às " + data.dados.hora_bip1;
             inputElem.value = "";
           } else {
             painel.className = "alert alert-danger border text-center my-0 py-3 fw-bold";
-            const prefixo = data.dados.na_base_comparacao ? "📚 Base histórica • " : "";
-            painel.innerText = "🚨 " + prefixo + "ALERTA DE DESVIO: NF " + data.dados.numero_nf + " | Tempo: " + data.dados.tempo_decorrido;
+            painel.innerText = "🚨 ALERTA DE DESVIO: NF " + data.dados.numero_nf + " | Tempo: " + data.dados.tempo_decorrido;
             chaveDesvio = data.dados.chave;
-            descModal.innerText = "A NF " + data.dados.numero_nf + " já possui saída anterior.\nTempo decorrido: " + data.dados.tempo_decorrido;
+            descModal.innerText = "A NF " + data.dados.numero_nf + " já possui saída anterior.\\nTempo decorrido: " + data.dados.tempo_decorrido;
             justInput.value = "";
-            btnSalvarJust.innerText = "Gravar Justificativa e Enviar E-mail";
             btnSalvarJust.disabled = false;
+            btnSalvarJust.innerText = "Gravar Justificativa e Enviar E-mail";
             modal.show();
           }
-        } catch (e) {
-          console.error(e);
+        }catch(e){
           painel.className = "alert alert-danger border text-center my-0 py-3 fw-bold";
           painel.innerText = "❌ Falha de comunicação com o servidor.";
-        } finally {
+        }finally{
           processando = false;
           await carregar();
           focar();
         }
       }
 
-      function biparManual() {
+      function biparManual(){
         if (processando) return;
         const chave = (inputElem.value || "").trim();
-        if (!chave) {
+        if (!chave){
           alert("Por favor, bip a nota fiscal ou cole a chave primeiro!");
-          focar();
-          return;
+          focar(); return;
         }
         ultChave = "";
         executarRequisicao(chave);
       }
 
-      function biparAutomatico() {
+      function biparAutomatico(){
         if (processando) return;
         const chave = (inputElem.value || "").trim();
         if (!chave) return;
-
         const now = Date.now();
-        if (chave === ultChave && (now - ultTime < 2500)) return; // anti-rebote
-        ultChave = chave;
-        ultTime = now;
-
+        if (chave === ultChave && (now - ultTime < 2500)) return;
+        ultChave = chave; ultTime = now;
         executarRequisicao(chave);
       }
 
-      async function salvarJust() {
+      async function salvarJust(){
         const just = (justInput.value || "").trim();
-        if (!just) {
-          alert("Digite o motivo obrigatório.");
-          return;
-        }
-
+        if (!just) return alert("Digite o motivo obrigatório.");
         btnSalvarJust.disabled = true;
         btnSalvarJust.innerText = "Salvando e Enviando E-mail...";
 
-        try {
-          const res = await fetch('/api/justificar', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({chave: chaveDesvio, justificativa: just})
-          });
-          const data = await res.json();
-          if (!res.ok || !data.sucesso) {
-            alert(data.mensagem || "Falha ao salvar justificativa.");
-          }
-          inputElem.value = "";
-        } catch (e) {
-          console.error(e);
-          alert("Falha ao salvar justificativa.");
+        const res = await fetch('/api/justificar', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({chave: chaveDesvio, justificativa: just})
+        });
+        const data = await res.json();
+        if (!res.ok || !data.sucesso){
+          alert(data.mensagem || "Falha ao salvar justificativa.");
         }
-
         modal.hide();
         await carregar();
         focar();
-      }
-
-      async function carregar() {
-        try {
-          const busca = encodeURIComponent(getBusca());
-          const res = await fetch('/api/historico?busca=' + busca);
-          const lista = await res.json();
-
-          corpo.innerHTML = "";
-          lista.forEach(n => {
-            let st = "";
-            const status = n.status || "";
-            if (status.includes("DESVIO")) st = '<span class="badge bg-danger">🚨 DESVIO</span>';
-            else if (status.includes("PENDENTE")) st = '<span class="badge bg-warning text-dark">⚠️ PENDENTE</span>';
-            else st = '<span class="badge bg-success">REGULAR</span>';
-
-            corpo.innerHTML += `<tr class="text-center">
-              <td class="fw-bold">${n.numero_nf || '-'}</td>
-              <td class="font-monospace small text-start">${n.chave || '-'}</td>
-              <td>${n.serie || '-'}</td>
-              <td>${n.data_bip1 || '-'}</td>
-              <td>${n.hora_bip1 || '-'}</td>
-              <td>${n.data_bip2 || '-'}</td>
-              <td>${n.hora_bip2 || '-'}</td>
-              <td class="fw-bold">${n.tempo_decorrido || '-'}</td>
-              <td>${st}</td>
-              <td class="text-start small">${n.justificativa || '-'}</td>
-            </tr>`;
-          });
-        } catch (e) {
-          console.error(e);
-        }
       }
 
       btnRegistrar.addEventListener('click', biparManual);
@@ -678,25 +706,11 @@ HTML = """<!DOCTYPE html>
       btnSalvarJust.addEventListener('click', salvarJust);
       btnAtualizar.addEventListener('click', carregar);
 
-      buscaInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          carregar();
-        }
-      });
-
-      inputElem.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          biparAutomatico();
-        }
-      });
-
-      inputElem.addEventListener('input', (e) => {
+      buscaInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); carregar(); }});
+      inputElem.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); biparAutomatico(); }});
+      inputElem.addEventListener('input', (e)=>{
         const v = (e.target.value || '').replace(/\\D/g, '');
-        if (v.length === 44 && v !== ultChave) {
-          setTimeout(biparAutomatico, 200);
-        }
+        if (v.length === 44 && v !== ultChave) setTimeout(biparAutomatico, 200);
       });
 
       carregar();
@@ -723,10 +737,7 @@ def api_bipar():
 
     d = sanitizar_e_extrair_chave(chave_raw)
     if not d["valida"]:
-        return jsonify({
-            "sucesso": False,
-            "mensagem": f"Chave inválida ({len(d['chave'])} dígitos). Precisa ter 44."
-        }), 400
+        return jsonify({"sucesso": False, "mensagem": "Chave inválida. Informe 44 dígitos."}), 400
 
     agora = agora_local()
     dt_str = agora.strftime("%d/%m/%Y")
@@ -737,25 +748,20 @@ def api_bipar():
     c = conn.cursor()
 
     try:
-        # Busca na base oculta
+        # base de comparação
         c.execute("SELECT * FROM base_comparacao WHERE chave = ?", (d["chave"],))
         row_base = c.fetchone()
         existe_base_comp = row_base is not None
 
-        # Busca no histórico operacional
+        # histórico operacional
         c.execute("SELECT * FROM notas WHERE chave = ?", (d["chave"],))
         nota = c.fetchone()
 
-        # -----------------------------------------------------
-        # Não existe em notas ainda
-        # -----------------------------------------------------
+        # não existe em notas ainda
         if not nota:
-            # Se existe na base oculta -> já entra como DESVIO
+            # se existe na base oculta -> já entra como desvio (2ª lógica)
             if existe_base_comp:
-                dt_ref = parse_data_hora_ref(row_base["data_ref"], row_base["hora_ref"])
-                if dt_ref is None:
-                    dt_ref = agora
-
+                dt_ref = parse_data_hora_ref(row_base["data_ref"], row_base["hora_ref"]) or agora
                 data_ref = dt_ref.strftime("%d/%m/%Y")
                 hora_ref = dt_ref.strftime("%H:%M:%S")
                 tempo_txt, mins = calcular_diferenca(dt_ref, agora)
@@ -777,6 +783,11 @@ def api_bipar():
                 ))
 
                 conn.commit()
+                audit_event(
+                    event_type="bipagem_desvio_por_base_comparacao",
+                    actor=request.remote_addr,
+                    details={"chave": d["chave"], "nf": d["numero_nf"]}
+                )
                 return jsonify({
                     "sucesso": True,
                     "tipo": "2ª Bipagem",
@@ -793,7 +804,7 @@ def api_bipar():
                     }
                 }), 200
 
-            # Fluxo regular
+            # fora da base oculta: REGULAR
             c.execute("""
                 INSERT INTO notas (
                     chave, numero_nf, serie,
@@ -820,9 +831,7 @@ def api_bipar():
                 }
             }), 200
 
-        # -----------------------------------------------------
-        # Já existe em notas -> desvio normal (2ª+ leitura)
-        # -----------------------------------------------------
+        # já existe em notas -> nova leitura vira desvio
         dt1 = parse_iso_db(nota["dt_completa_bip1"]) or agora
         tempo_txt, mins = calcular_diferenca(dt1, agora)
 
@@ -872,9 +881,10 @@ def api_bipar():
             }
         }), 200
 
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"sucesso": False, "mensagem": f"Erro ao processar bipagem: {str(e)}"}), 500
+        # não vaza detalhes internos
+        return jsonify({"sucesso": False, "mensagem": "Erro interno do servidor."}), 500
     finally:
         conn.close()
 
@@ -896,14 +906,20 @@ def api_justificar():
         c.execute("SELECT * FROM notas WHERE chave = ?", (chave,))
         row = c.fetchone()
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         conn.close()
-        return jsonify({"sucesso": False, "mensagem": f"Falha ao salvar justificativa: {e}"}), 500
+        return jsonify({"sucesso": False, "mensagem": "Erro interno do servidor."}), 500
     finally:
         conn.close()
 
     if row:
+        audit_event(
+            event_type="justificativa_registrada",
+            actor=request.remote_addr,
+            details={"chave": chave, "nf": row["numero_nf"]}
+        )
+
         def disparar_email():
             cfg = carregar_config()
             destinatarios = cfg.get("destinatarios", [])
@@ -931,6 +947,9 @@ def api_justificar():
 @app.route("/api/historico")
 def api_historico():
     busca = (request.args.get("busca") or "").strip()
+    # proteção básica contra abusos de payload
+    if len(busca) > 100:
+        return jsonify({"sucesso": False, "mensagem": "Filtro inválido."}), 400
 
     conn = obter_conexao()
     c = conn.cursor()
@@ -996,60 +1015,44 @@ def api_exportar():
 
 
 @app.route("/api/importar-base-comparacao", methods=["POST"])
+@require_admin_key
 def api_importar_base_comparacao():
-    """
-    multipart/form-data:
-      - arquivo: .xlsx (obrigatório)
-      - aba: nome da aba (opcional)
-    """
+    # multipart/form-data: arquivo + aba(opcional)
     if "arquivo" not in request.files:
         return jsonify({"sucesso": False, "mensagem": "Envie o arquivo no campo 'arquivo'."}), 400
 
-    file = request.files["arquivo"]
-    nome_arquivo = (file.filename or "arquivo.xlsx").strip()
+    arq = request.files["arquivo"]
+    nome_arquivo = (arq.filename or "arquivo.xlsx").strip()
     aba_req = (request.form.get("aba") or "").strip()
 
     if not nome_arquivo.lower().endswith(".xlsx"):
         return jsonify({"sucesso": False, "mensagem": "Formato inválido. Envie .xlsx"}), 400
 
     try:
-        wb = openpyxl.load_workbook(file, data_only=True)
-    except Exception as e:
-        return jsonify({"sucesso": False, "mensagem": f"Falha ao ler Excel: {e}"}), 400
+        wb = openpyxl.load_workbook(arq, data_only=True)
+    except Exception:
+        return jsonify({"sucesso": False, "mensagem": "Falha ao ler arquivo Excel."}), 400
 
     if aba_req:
         if aba_req not in wb.sheetnames:
-            return jsonify({
-                "sucesso": False,
-                "mensagem": f"Aba '{aba_req}' não encontrada. Abas disponíveis: {', '.join(wb.sheetnames)}"
-            }), 400
+            return jsonify({"sucesso": False, "mensagem": f"Aba '{aba_req}' não encontrada."}), 400
         ws = wb[aba_req]
     else:
         ws = wb[wb.sheetnames[0]]
 
     colmap = detectar_colunas_base(ws)
     if not colmap["chave"]:
-        return jsonify({
-            "sucesso": False,
-            "mensagem": "Não encontrei coluna de CHAVE. Use cabeçalhos como 'Chave' ou 'Chave de Acesso'."
-        }), 400
+        return jsonify({"sucesso": False, "mensagem": "Coluna de CHAVE não identificada."}), 400
 
     validos, rejeitados = extrair_registros_base(ws, colmap)
-
     if not validos:
-        return jsonify({
-            "sucesso": False,
-            "mensagem": "Nenhum registro válido (44 dígitos) encontrado para importar.",
-            "rejeitados": len(rejeitados)
-        }), 400
-
-    agora_iso = agora_local().isoformat()
+        return jsonify({"sucesso": False, "mensagem": "Nenhum registro válido para importação."}), 400
 
     conn = obter_conexao()
     c = conn.cursor()
-
     inseridos = 0
     atualizados = 0
+    now_iso = agora_local().isoformat()
 
     try:
         for row in validos:
@@ -1069,7 +1072,7 @@ def api_importar_base_comparacao():
                     importado_em=excluded.importado_em
             """, (
                 row["chave"], row["numero_nf"], row["serie"],
-                row["data_ref"], row["hora_ref"], nome_arquivo, agora_iso
+                row["data_ref"], row["hora_ref"], nome_arquivo, now_iso
             ))
 
             if exists:
@@ -1078,12 +1081,25 @@ def api_importar_base_comparacao():
                 inseridos += 1
 
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         conn.close()
-        return jsonify({"sucesso": False, "mensagem": f"Falha na importação: {e}"}), 500
+        return jsonify({"sucesso": False, "mensagem": "Falha na importação da base."}), 500
     finally:
         conn.close()
+
+    audit_event(
+        event_type="import_base_comparacao",
+        actor=request.remote_addr,
+        details={
+            "arquivo": nome_arquivo,
+            "aba": ws.title,
+            "linhas_validas": len(validos),
+            "inseridos": inseridos,
+            "atualizados": atualizados,
+            "rejeitados": len(rejeitados),
+        }
+    )
 
     return jsonify({
         "sucesso": True,
@@ -1100,6 +1116,7 @@ def api_importar_base_comparacao():
 
 
 @app.route("/api/base-comparacao/resumo")
+@require_admin_key
 def api_base_comparacao_resumo():
     conn = obter_conexao()
     c = conn.cursor()
@@ -1114,36 +1131,43 @@ def api_base_comparacao_resumo():
         LIMIT 1
     """)
     last = c.fetchone()
-
     conn.close()
+
     return jsonify({
         "sucesso": True,
         "total_registros_base": total,
         "ultimo_arquivo": (last["origem_arquivo"] if last else None),
-        "ultimo_importado_em": (last["importado_em"] if last else None),
+        "ultimo_importado_em": (last["importado_em"] if last else None)
     }), 200
 
 
 @app.route("/api/base-comparacao/limpar", methods=["POST"])
+@require_admin_key
 def api_base_comparacao_limpar():
     conn = obter_conexao()
     c = conn.cursor()
     try:
         c.execute("DELETE FROM base_comparacao")
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         conn.close()
-        return jsonify({"sucesso": False, "mensagem": f"Erro ao limpar base: {e}"}), 500
+        return jsonify({"sucesso": False, "mensagem": "Erro interno do servidor."}), 500
     finally:
         conn.close()
 
+    audit_event(
+        event_type="clear_base_comparacao",
+        actor=request.remote_addr,
+        details={}
+    )
     return jsonify({"sucesso": True, "mensagem": "Base de comparação limpa com sucesso."}), 200
 
 
 # =========================================================
-# INIT
+# BOOT
 # =========================================================
+validar_configuracao()
 inicializar_banco()
 
 if __name__ == "__main__":
